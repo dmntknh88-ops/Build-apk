@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       payload:
-        description: 'JSON payload (zipAssetUrl, appName, packageName, etc)'
+        description: 'JSON payload (zipAssetUrl wajib dari bot)'
         required: true
         type: string
 
@@ -21,6 +21,7 @@ env:
   FLUTTER_VERSION: '3.24.5'
   ANDROID_API: '34'
   BUILD_TOOLS: '34.0.0'
+  CMDLINE_TOOLS: '11076708'
 
 jobs:
   build:
@@ -28,8 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write
-      actions: read
+      contents: read
+      actions: write
 
     steps:
       - name: Checkout
@@ -37,38 +38,26 @@ jobs:
 
       - name: Parse payload
         id: meta
-        shell: bash
         run: |
           set -e
-          PAYLOAD='${{ inputs.payload }}'
-          echo "$PAYLOAD" > /tmp/payload.json
-          python3 - <<'PY'
-          import json, os
-          p = json.load(open('/tmp/payload.json'))
-          def out(k, v):
-              v = '' if v is None else str(v)
-              # multiline safe
-              print(f'{k}={v}')
-          out('zip_url', p.get('zipAssetUrl') or p.get('zip_url') or '')
-          out('app_name', p.get('appName') or p.get('app_name') or 'MyApp')
-          out('package_name', p.get('packageName') or p.get('package_name') or 'com.example.app')
-          out('release_tag', p.get('zipReleaseTag') or p.get('release_tag') or '')
-          PY
-          while IFS='=' read -r k v; do
-            echo "$k=$v" >> $GITHUB_OUTPUT
-          done < <(python3 - <<'PY'
+          echo '${{ inputs.payload }}' > /tmp/payload.json
+          python3 - <<'PY' >> $GITHUB_OUTPUT
           import json
           p = json.load(open('/tmp/payload.json'))
-          print('zip_url=' + (p.get('zipAssetUrl') or p.get('zip_url') or ''))
-          print('app_name=' + (p.get('appName') or p.get('app_name') or 'MyApp'))
-          print('package_name=' + (p.get('packageName') or p.get('package_name') or 'com.example.app'))
-          print('release_tag=' + (p.get('zipReleaseTag') or p.get('release_tag') or ''))
+          def g(*keys):
+              for k in keys:
+                  v = p.get(k)
+                  if v: return str(v)
+              return ''
+          print('zip_url=' + g('zipAssetUrl', 'zip_url', 'assetUrl'))
+          print('app_name=' + g('appName', 'app_name') or 'MyApp')
+          print('package_name=' + g('packageName', 'package_name') or 'com.example.app')
+          print('release_tag=' + g('zipReleaseTag', 'release_tag'))
           PY
-          )
           echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
-          echo "Payload parsed for job ${{ inputs.jobId }}"
+          echo "Payload OK job=${{ inputs.jobId }}"
 
-      - name: Setup Java
+      - name: Setup Java ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -77,52 +66,74 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android packages
+      - name: Install Android SDK components
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-${{ env.ANDROID_API }}" "build-tools;${{ env.BUILD_TOOLS }}"
+          set -e
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${{ env.ANDROID_API }}" \
+            "build-tools;${{ env.BUILD_TOOLS }}" \
+            "ndk;26.1.10909125" || true
           yes | sdkmanager --licenses || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --list_installed | head -40
 
-      - name: Setup Flutter
+      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
           cache: true
 
-      - name: Download project ZIP from Release
+      - name: Flutter doctor
+        run: |
+          flutter config --no-analytics
+          flutter doctor -v
+
+      # ── ZIP diunduh DARI GITHUB RELEASE (bukan dari VPS/Local API) ──
+      - name: Download project ZIP from GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ZIP_URL: ${{ steps.meta.outputs.zip_url }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p project_src
-          if [ -z "$ZIP_URL" ]; then
-            echo "ERROR: zipAssetUrl kosong di payload"
+          if [ -z "${ZIP_URL}" ]; then
+            echo "::error::zipAssetUrl kosong di payload. Bot harus upload ZIP ke Release dulu."
+            cat /tmp/payload.json || true
             exit 1
           fi
-          echo "Downloading project ZIP..."
-          # API asset URL needs Accept + token
-          curl -fL \
-            -H "Authorization: Bearer $GH_TOKEN" \
+          echo "Downloading ZIP from GitHub asset API..."
+          echo "URL: $ZIP_URL"
+          # GITHUB_TOKEN repo ini cukup untuk unduh release asset repo yang sama
+          HTTP=$(curl -sS -L -o project.zip -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/octet-stream" \
-            -o project.zip \
-            "$ZIP_URL"
-          SIZE=$(stat -c%s project.zip)
-          echo "Downloaded $SIZE bytes"
+            "${ZIP_URL}")
+          echo "HTTP $HTTP"
+          SIZE=$(stat -c%s project.zip 2>/dev/null || echo 0)
+          echo "Downloaded ${SIZE} bytes"
+          if [ "$HTTP" != "200" ] && [ "$HTTP" != "302" ]; then
+            echo "::error::Gagal unduh ZIP HTTP $HTTP"
+            head -c 500 project.zip || true
+            exit 1
+          fi
           if [ "$SIZE" -lt 1000 ]; then
-            echo "ZIP terlalu kecil / gagal download"
+            echo "::error::ZIP terlalu kecil / bukan binary"
             head -c 500 project.zip || true
             exit 1
           fi
           unzip -q project.zip -d project_src
-          # Flatten if single root folder
-          if [ $(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ] && [ $(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 0 ]; then
+          # flatten single root folder
+          if [ "$(find project_src -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] && \
+             [ "$(find project_src -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0 ]; then
             ROOT=$(find project_src -mindepth 1 -maxdepth 1 -type d | head -1)
             mv "$ROOT"/* project_src/ 2>/dev/null || true
-            mv "$ROOT"/.* project_src/ 2>/dev/null || true
+            mv "$ROOT"/.[!.]* project_src/ 2>/dev/null || true
             rmdir "$ROOT" 2>/dev/null || true
           fi
-          ls -la project_src | head -30
+          echo "Project tree:"
+          find project_src -maxdepth 3 -type f | head -50
 
       - name: Locate Flutter project
         id: proj
@@ -133,29 +144,32 @@ jobs:
           else
             FOUND=$(find project_src -name pubspec.yaml -type f | head -1)
             if [ -z "$FOUND" ]; then
-              echo "pubspec.yaml tidak ditemukan"
-              find project_src -maxdepth 3 -type f | head -50
+              echo "::error::pubspec.yaml tidak ada di ZIP"
+              find project_src -maxdepth 4 -type f | head -80
               exit 1
             fi
-            DIR=$(dirname "$FOUND")
-            echo "dir=$DIR" >> $GITHUB_OUTPUT
+            echo "dir=$(dirname "$FOUND")" >> $GITHUB_OUTPUT
           fi
-          echo "Project dir: $(cat $GITHUB_OUTPUT | grep dir=)"
+          echo "Using dir=$(grep dir= $GITHUB_OUTPUT | tail -1)"
 
-      - name: Flutter pub get
+      - name: flutter pub get
         working-directory: ${{ steps.proj.outputs.dir }}
         run: |
-          flutter config --no-analytics
           flutter pub get
+          flutter precache --android || true
 
-      - name: Build APK (release)
+      - name: Build APK release
         working-directory: ${{ steps.proj.outputs.dir }}
         run: |
+          set -e
           flutter build apk --release
-          APK=$(find build/app/outputs/flutter-apk -name '*.apk' | head -1)
+          APK=$(find build/app/outputs/flutter-apk -name '*.apk' -type f | head -1)
           if [ -z "$APK" ]; then
-            echo "APK tidak ditemukan setelah build"
-            find build -name '*.apk' || true
+            APK=$(find build -name '*.apk' -type f | head -1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan setelah build"
+            find build -type f | head -50
             exit 1
           fi
           cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
@@ -167,4 +181,4 @@ jobs:
           name: apk-${{ inputs.jobId }}
           path: app-release.apk
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 3
